@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# llm-assistant - 启动 AI 助手浮动气泡窗口
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MAX_WAIT="${LLM_ASSISTANT_MAX_WAIT:-120}"
+LOCAL_MODEL_ALIAS="${LLM_ASSISTANT_MODEL_ALIAS:-qwen36}"
+
+# ============================================================
+# 依赖检查
+# ============================================================
+if ! python3 -c "import PyQt6" 2>/dev/null; then
+    echo "❌ 需要安装 PyQt6:"
+    echo "   sudo pacman -S --needed python-pyqt6"
+    exit 1
+fi
+
+for dep in curl llama-serve; do
+    if ! command -v "$dep" &>/dev/null; then
+        echo "❌ 缺少依赖: $dep"
+        exit 1
+    fi
+done
+
+CONFIG_LINE="$(python3 -c '
+import sys
+from urllib.parse import urlparse
+sys.path.insert(0, sys.argv[1])
+from llm_core.config import get_config
+url = get_config().llm_url
+parsed = urlparse(url)
+port = parsed.port or (443 if parsed.scheme == "https" else 80)
+print(f"{url}\t{parsed.hostname or ""}\t{port}")
+' "$SCRIPT_DIR")"
+IFS=$'\t' read -r LLAMA_URL LLAMA_HOST LLAMA_PORT <<< "$CONFIG_LINE"
+
+check_llama_health() {
+    curl --noproxy "localhost,127.0.0.1,::1" -sf --max-time 3 \
+        "$LLAMA_URL/v1/models" &>/dev/null
+}
+
+# ============================================================
+# 启动 llama-server（如未运行）
+# ============================================================
+if ! check_llama_health; then
+    if [[ "$LLAMA_HOST" != "127.0.0.1" && "$LLAMA_HOST" != "localhost" && "$LLAMA_HOST" != "::1" ]]; then
+        echo "❌ 配置的 LLM 服务不可用: $LLAMA_URL"
+        echo "   非本机地址不会自动启动 llama-server"
+        exit 1
+    fi
+
+    echo "🚀 llama-server 未运行，正在启动..."
+    SERVE_ARGS=("$LOCAL_MODEL_ALIAS")
+    if [[ "$LLAMA_PORT" != "18080" ]]; then
+        SERVE_ARGS+=(--port "$LLAMA_PORT")
+    fi
+    llama-serve "${SERVE_ARGS[@]}" &
+    SERVER_PID=$!
+    echo -n "⏳ 等待服务就绪"
+
+    for i in $(seq 1 "$MAX_WAIT"); do
+        if check_llama_health; then
+            echo " ✅"
+            break
+        fi
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo ""
+            wait "$SERVER_PID" || true
+            echo "❌ llama-server 启动进程已退出"
+            exit 1
+        fi
+        if [[ $i -eq "$MAX_WAIT" ]]; then
+            echo ""
+            echo "❌ llama-server 启动超时 (${MAX_WAIT}s)"
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+            echo "   请手动检查: llama-serve $LOCAL_MODEL_ALIAS &"
+            exit 1
+        fi
+        echo -n "."
+        sleep 1
+    done
+fi
+
+# ============================================================
+# 启动 GUI
+# ============================================================
+echo "🤖 启动 AI 助手..."
+cd "$SCRIPT_DIR"
+python3 "$SCRIPT_DIR/llm-assistant-qt.py"

@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPCODE_PORT=18080
+
+usage() {
+  cat <<EOF
+Usage: llama-serve <model> [options] [-- extra llama-server args]
+
+Models (alias → file):
+  lfm28           LFM2-8B-A1B-Q4_K_M        (dgpu  4.7G) ← Agent/速答
+  qwen36          Qwen3.6-35B-A3B-UD-Q4_K_M (fiton 21G)  ← 复杂推理主力 (默认端口 18080)
+  qwcoder         Qwen3-Coder-30B-A3B-Q4_K_M(fiton 18G)  ← 编码
+  gemma4          Gemma4-26B-A4B-q4_k_m     (fiton 16G)  ← 推理/多模态
+  embed/nomic     nomic-embed-text-v1.5      (dgpu 81MB) ← Embedding/RAG
+
+Options:
+  --port PORT       server port (default: ${OPCODE_PORT}, opencode 配置的端口)
+  -c N              context size (default: model-specific)
+  --                pass remaining args directly to llama-server
+  -h                show this help
+
+注意:
+  端口约定:
+    18080  主推理 (qwen36)
+    18081  llm-proxy (llm-ui Web 代理), 不要被模型占用
+    18082  编码模型 (qwcoder)
+  多实例（opencode 双 provider 场景）:
+    llama-serve qwen36            # port 18080 (推理)
+    llama-serve qwcoder --port 18082   # port 18082 (编码)
+  单实例: 省略 --port，自动停旧启新，默认 18080。
+  切换 reasoning/non-reasoning 模型后需同步 opencode.jsonc。
+EOF
+  exit 0
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+MODELS_DIR="${MODELS_DIR:-$HOME/ai/models}"
+LLAMA_DIR="$HOME/ai/llama.cpp-build/bin"
+
+if [[ $# -lt 1 || "$1" == "-h" ]]; then usage; fi
+
+ALIAS="$1"
+shift
+
+# ---- model config ----
+# 所有模型默认端口 = OPCODE_PORT，--port 可覆盖
+declare -A MODEL_FILE MODEL_MODE MODEL_CACHE_RAM MODEL_CTX MODEL_HAS_REASONING MODEL_EXTRA
+
+MODEL_FILE[lfm28]="LFM2-8B-A1B-Q4_K_M.gguf"
+MODEL_MODE[lfm28]=dgpu
+MODEL_CACHE_RAM[lfm28]=2048
+MODEL_CTX[lfm28]=16384
+MODEL_HAS_REASONING[lfm28]=false
+MODEL_EXTRA[lfm28]="--reasoning off"
+
+MODEL_FILE[qwen36]="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+MODEL_MODE[qwen36]=fiton
+MODEL_CACHE_RAM[qwen36]=4096
+MODEL_CTX[qwen36]=196608
+MODEL_HAS_REASONING[qwen36]=true
+MODEL_EXTRA[qwen36]=""
+
+MODEL_FILE[qwcoder]="Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+MODEL_MODE[qwcoder]=fiton
+MODEL_CACHE_RAM[qwcoder]=4096
+MODEL_CTX[qwcoder]=196608
+MODEL_HAS_REASONING[qwcoder]=true
+MODEL_EXTRA[qwcoder]=""
+
+MODEL_FILE[gemma4]="Gemma4-26B-A4B-q4_k_m.gguf"
+MODEL_MODE[gemma4]=fiton
+MODEL_CACHE_RAM[gemma4]=4096
+MODEL_CTX[gemma4]=196608
+MODEL_HAS_REASONING[gemma4]=true
+MODEL_EXTRA[gemma4]=""
+
+MODEL_FILE[embed]="nomic-embed-text-v1.5.Q4_K_M.gguf"
+MODEL_MODE[embed]=dgpu
+MODEL_CACHE_RAM[embed]=0
+MODEL_CTX[embed]=8192
+MODEL_HAS_REASONING[embed]=false
+MODEL_EXTRA[embed]=""
+
+# aliases
+for alias in nomic; do
+  MODEL_FILE[$alias]="${MODEL_FILE[embed]}"
+  MODEL_MODE[$alias]="${MODEL_MODE[embed]}"
+  MODEL_CACHE_RAM[$alias]="${MODEL_CACHE_RAM[embed]}"
+  MODEL_CTX[$alias]="${MODEL_CTX[embed]}"
+  MODEL_HAS_REASONING[$alias]="${MODEL_HAS_REASONING[embed]}"
+  MODEL_EXTRA[$alias]="${MODEL_EXTRA[embed]}"
+done
+
+if [[ -z "${MODEL_FILE[$ALIAS]:-}" ]]; then
+  die "unknown model '$ALIAS'"; usage
+fi
+
+MODEL_PATH="$MODELS_DIR/${MODEL_FILE[$ALIAS]}"
+[[ -f "$MODEL_PATH" ]] || die "model file not found: $MODEL_PATH"
+
+CTX="${MODEL_CTX[$ALIAS]}"
+CACHE_RAM="${MODEL_CACHE_RAM[$ALIAS]}"
+MODE="${MODEL_MODE[$ALIAS]}"
+EXTRA="${MODEL_EXTRA[$ALIAS]:-}"
+
+ARGS=()
+PORT="$OPCODE_PORT"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    -c) CTX="$2"; shift 2 ;;
+    --) shift; ARGS+=("$@"); break ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+# kill existing server on the target port
+if lsof -ti "tcp:$PORT" &>/dev/null; then
+  echo "[llama-serve] stopping existing server on port $PORT ..."
+  lsof -ti "tcp:$PORT" | xargs -r kill 2>/dev/null
+  sleep 1
+fi
+
+SERVER_ARGS=(
+  -m "$MODEL_PATH"
+  -c "$CTX"
+  --cache-ram "$CACHE_RAM"
+  --port "$PORT"
+  --flash-attn on
+  --no-mmap
+)
+[[ "$MODE" == "fiton" ]] && SERVER_ARGS+=(--fit on)
+[[ -n "$EXTRA" ]] && SERVER_ARGS+=($EXTRA)
+SERVER_ARGS+=("${ARGS[@]}")
+
+echo "[llama-serve] model:      ${MODEL_FILE[$ALIAS]}"
+echo "[llama-serve] mode:       ${MODE}"
+echo "[llama-serve] port:       ${PORT} (opencode 配置端口)"
+echo "[llama-serve] ctx:        ${CTX}"
+echo "[llama-serve] cache-ram:  ${CACHE_RAM}"
+echo "[llama-serve] url:        http://127.0.0.1:${PORT}/v1"
+if [[ "${MODEL_HAS_REASONING[$ALIAS]}" == "true" ]]; then
+  echo "[llama-serve] reasoning:  enabled"
+else
+  echo "[llama-serve] reasoning:  disabled（如需切换需更新 opencode.jsonc）"
+fi
+echo ""
+
+exec env \
+  GGML_BACKEND_PATH="$LLAMA_DIR/libggml-hip.so" \
+  LD_LIBRARY_PATH="$LLAMA_DIR:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$LLAMA_DIR/llama-server" "${SERVER_ARGS[@]}"

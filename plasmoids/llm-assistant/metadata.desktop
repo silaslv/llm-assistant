@@ -1,0 +1,20 @@
+[Desktop Entry]
+Name=LLM Assistant
+Comment=Local AI Assistant with Voice Control
+Type=Service
+ServiceTypes=Plasma/Applet
+
+X-Plasma-API=declarativeappletscript
+X-Plasma-MainScript=ui/main.qml
+X-Plasma-ProvidesCategories=Utilities
+X-Plasma-DBus-Service=org.kde.plasma.llm-assistant
+X-Plasma-DBus-Path=/llm-assistant
+
+X-KDE-PluginInfo-Author=xuxin
+X-KDE-PluginInfo-Email=
+X-KDE-PluginInfo-Version=1.0
+X-KDE-PluginInfo-Name=org.kde.plasma.llm-assistant
+X-KDE-PluginInfo-Category=Utilities
+X-KDE-PluginInfo-Depends=plasma-core
+X-KDE-PluginInfo-License=GPL
+X-KDE-PluginInfo-EnabledByDefault=true
