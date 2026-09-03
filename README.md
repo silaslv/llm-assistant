@@ -1,25 +1,52 @@
 # LLM Assistant
 
-A local KDE Plasma and PyQt6 desktop assistant backed by an OpenAI-compatible
-`llama-server` endpoint.
+[![Tests](https://github.com/silaslv/llm-assistant/actions/workflows/tests.yml/badge.svg)](https://github.com/silaslv/llm-assistant/actions/workflows/tests.yml)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-KDE%20Plasma%206-1D99F3?logo=kde&logoColor=white)](https://kde.org/plasma-desktop/)
 
-## Features
+A local-first LLM desktop assistant for KDE Plasma and PyQt6, backed by an
+OpenAI-compatible `llama-server` endpoint and a security-aware tool-calling loop.
 
-- Streaming local-LLM chat UI with a system tray icon
-- KDE Plasma 6 widget through a D-Bus backend
-- Optional voice input through `~/.local/bin/voice-control-run`
-- Fixed volume and brightness controls
-- Tool calling with confirmation gates, sensitive-path protection, and audit logs
+## Why this project
 
-## Layout
+The project explores how to turn probabilistic model output into controlled local
+actions. Model access, agent orchestration, tools, confirmation policy, and audit
+logging live in a shared Python core so different desktop clients follow the same
+execution rules.
 
-- `scripts/llm-assistant` — starts the model server when needed, then launches the PyQt UI
-- `scripts/llm-assistant-qt.py` — floating desktop UI
-- `scripts/llm-assistant-backend.py` — D-Bus and Unix-socket backend for the Plasma widget
-- `scripts/llama-serve` — local model launcher and model-alias configuration
-- `scripts/llm_core/` — client, agent loop, tools, configuration, and security policy
-- `plasmoids/llm-assistant/` — Plasma 6 widget
-- `scripts/tests/` — unit tests
+## Highlights
+
+- Streaming chat through an OpenAI-compatible HTTP/SSE client
+- Shared `llm_core` for the PyQt6 UI, local clients, and Plasma backend
+- Multi-turn tool calling with bounded iterations and explicit error handling
+- Confirmation gates for shell commands, file writes, and reads outside allowed roots
+- Sensitive-path protection, dangerous-command blocking, and redacted JSONL audit logs
+- KDE Plasma 6 widget over D-Bus and a Unix-socket interface for local clients
+- Optional voice input plus volume and brightness controls
+- 65 unit tests covering the agent loop, tools, configuration, and security policy
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Q[PyQt6 UI] --> C[llm_core]
+    P[KDE Plasma widget] -->|D-Bus| B[Local backend]
+    U[Local client] -->|Unix socket| B
+    B --> C
+    C --> A[Agent loop and tool registry]
+    A --> S[Confirmation, policy, and audit]
+    A -->|OpenAI-compatible HTTP/SSE| L[llama-server]
+```
+
+## Repository layout
+
+- `scripts/llm-assistant` - starts the model server when needed, then launches the PyQt6 UI
+- `scripts/llm-assistant-qt.py` - floating desktop UI and system tray integration
+- `scripts/llm-assistant-backend.py` - D-Bus and Unix-socket backend
+- `scripts/llama-serve` - local model launcher and model-alias configuration
+- `scripts/llm_core/` - client, agent loop, tools, configuration, and security policy
+- `plasmoids/llm-assistant/` - KDE Plasma 6 widget
+- `scripts/tests/` - unit tests
 
 Model files, llama.cpp sources, and compiled binaries are intentionally excluded.
 
@@ -36,7 +63,7 @@ The current setup targets Arch Linux with KDE Plasma 6. Runtime dependencies inc
 The bundled `llama-serve` script expects binaries below `~/ai/llama.cpp-build/bin`
 and GGUF models below `~/ai/models`. Adjust it for other layouts.
 
-## Usage
+## Quick start
 
 Start the floating assistant:
 
@@ -51,12 +78,12 @@ scripts/install-plasmoid.sh
 ```
 
 Configuration is read from `~/.config/llm-assistant/config.json`. Environment
-variables such as `LLM_URL`, `LLM_PORT`, and `LLM_MODEL` can override LLM settings.
+variables such as `LLM_URL`, `LLM_PORT`, and `LLM_MODEL` can override model settings.
 
 ## Security model
 
 - Dangerous command patterns are blocked.
-- Every arbitrary shell command and every file write requires explicit confirmation.
+- Arbitrary shell commands and file writes require explicit confirmation.
 - Reads outside configured roots require confirmation.
 - Sensitive paths and virtual/device trees such as `/proc`, `/sys`, and `/dev` are blocked.
 - Audit logs redact written content and are stored with mode `0600`.
@@ -69,3 +96,5 @@ confirmation prompt and do not treat model output as trusted instructions.
 ```bash
 python -m pytest -q
 ```
+
+Current local verification: **65 tests passed**.
