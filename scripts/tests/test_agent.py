@@ -96,6 +96,25 @@ class TestLLMClient:
         assert LLMClient("http://localhost:18080")._opener is not None
         assert LLMClient("https://example.com")._opener is None
 
+    @patch.object(LLMClient, "_open")
+    def test_schema_constrained_completion(self, mock_open):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "content": '{"kind":"chat","confidence":0.99}'
+        }).encode()
+        mock_open.return_value.__enter__.return_value = mock_resp
+        client = LLMClient()
+        schema = {
+            "type": "object",
+            "properties": {"kind": {"type": "string"}},
+            "required": ["kind"],
+        }
+        result = client.complete_json("route this", schema, max_tokens=32)
+        assert result["kind"] == "chat"
+        payload = json.loads(mock_open.call_args.args[0].data)
+        assert payload["json_schema"] == schema
+        assert payload["temperature"] == 0
+
 
 class TestAgentLoop:
     """Agent 循环测试"""

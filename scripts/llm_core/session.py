@@ -1,7 +1,8 @@
 """One session for typed and spoken input, including short desktop follow-ups."""
 from llm_core.agent import AgentLoop
 from llm_core.desktop import DesktopController
-from llm_core.intent import ModelIntentRecognizer, looks_like_desktop_command
+from llm_core.intent import ModelIntentRecognizer
+from llm_core.tools import execute_tool
 
 class AssistantSession:
     def __init__(self, intent_recognizer=None):
@@ -11,15 +12,19 @@ class AssistantSession:
 
     def stream(self,query):
         intent=self.desktop.parse(query)
-        if intent is None and looks_like_desktop_command(query):
+        if intent is None:
             classified=self.intent_recognizer.classify(query,self.desktop.recent_target())
             if classified is not None and classified.action!='chat': intent=classified
         answer=''
-        if intent:
+        if intent and intent.action=='tool':
+            name,args=intent.value
+            answer=execute_tool(name,args)
+            yield {'type':'text','content':answer}
+        elif intent:
             answer=self.desktop.execute(intent)
             yield {'type':'text','content':answer}
         else:
-            for event in AgentLoop().run_stream(query,history=self.history):
+            for event in AgentLoop().run_stream(query,history=list(self.history)):
                 if event.get('type')=='text': answer+=event.get('content','')
                 yield event
         if answer:

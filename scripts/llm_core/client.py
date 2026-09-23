@@ -193,6 +193,38 @@ class LLMClient:
         except Exception as e:
             raise LLMError(f"流式请求失败: {e}") from e
 
+    def complete_json(
+        self, prompt: str, schema: dict, max_tokens: int = 256
+    ) -> dict:
+        """Return schema-constrained JSON through llama.cpp's native endpoint."""
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "n_predict": max_tokens,
+            "temperature": 0,
+            "json_schema": schema,
+        }
+        try:
+            req = urllib.request.Request(
+                f"{self._base_url}/completion",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with self._open(req, timeout=self._timeout) as resp:
+                body = json.loads(resp.read())
+            content = body.get("content", "")
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                raise ValueError("structured response is not an object")
+            return parsed
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, ConnectionRefusedError) or "Connection refused" in str(e.reason):
+                raise ServerNotRunningError("❌ llama-server 未运行") from e
+            raise LLMError(f"连接错误: {e}") from e
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            raise LLMError(f"结构化响应解析错误: {e}") from e
+        except Exception as e:
+            raise LLMError(f"结构化请求失败: {e}") from e
+
 
 def get_client(base_url: str | None = None) -> LLMClient:
     """获取 LLM 客户端实例。"""

@@ -90,7 +90,9 @@ def test_simple_commands_do_not_need_model(controller):
     assert any(e.get('content')=='已取消静音。' for e in events)
 
 def test_session_keeps_bounded_conversation():
-    session=AssistantSession()
+    recognizer=Mock()
+    recognizer.classify.return_value=Intent('chat')
+    session=AssistantSession(intent_recognizer=recognizer)
     with patch('llm_core.session.AgentLoop') as agent:
         agent.return_value.run_stream.return_value=[{'type':'text','content':'你好'}]
         for i in range(9): list(session.stream('你好'+str(i)))
@@ -99,13 +101,43 @@ def test_session_keeps_bounded_conversation():
 
 def test_model_intent_is_structured_and_validated():
     client=Mock()
-    client.chat.return_value={'choices':[{'message':{'tool_calls':[{
-        'function':{'name':'classify_desktop_intent',
-                    'arguments':'{"action":"volume_delta","value":5,"confidence":0.96}'},
-    }]}}]}
+    client.complete_json.side_effect=[
+        {'kind':'local_action','confidence':.96},
+        {'action':'volume_delta','value':'5','command':'','path':'',
+         'content':'','confidence':.96},
+    ]
     recognizer=ModelIntentRecognizer(client)
     assert recognizer.classify('这个视频声音有点小')==Intent('volume_delta',5)
-    assert client.chat.call_args.kwargs['tool_choice']['function']['name']=='classify_desktop_intent'
+    assert client.complete_json.call_count==2
+
+def test_model_routes_local_inspection_to_tool_without_phrase_whitelist():
+    client=Mock()
+    client.complete_json.side_effect=[
+        {'kind':'local_action','confidence':.97},
+        {'action':'execute_command','value':'',
+         'command':'ps -eo pid,comm,rss --sort=-rss | head',
+         'path':'','content':'','confidence':.97},
+    ]
+    recognizer=ModelIntentRecognizer(client)
+    assert recognizer.classify('帮我找出现在最吃资源的东西')==Intent(
+        'tool',('execute_command',{'command':'ps -eo pid,comm,rss --sort=-rss | head'}))
+
+def test_model_routes_how_to_question_to_chat():
+    client=Mock()
+    client.complete_json.return_value={'kind':'chat','confidence':.98}
+    recognizer=ModelIntentRecognizer(client)
+    assert recognizer.classify('怎么用命令查看内存最大的进程')==Intent('chat')
+    client.complete_json.assert_called_once()
+
+def test_session_forces_model_selected_tool():
+    recognizer=Mock()
+    routed=('execute_command',{'command':'ps -eo pid,comm,rss --sort=-rss | head'})
+    recognizer.classify.return_value=Intent('tool',routed)
+    session=AssistantSession(intent_recognizer=recognizer)
+    with patch('llm_core.session.execute_tool',return_value='真实结果') as execute:
+        events=list(session.stream('检查当前哪个程序最占内存'))
+    execute.assert_called_once_with(*routed)
+    assert any(e.get('content')=='真实结果' for e in events)
 
 def test_invalid_model_intent_never_executes():
     recognizer=ModelIntentRecognizer(Mock())

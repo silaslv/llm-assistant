@@ -1,5 +1,4 @@
-"""Constrained model fallback for desktop intent recognition."""
-import json
+"""Constrained model routing for conversation and local operations."""
 import re
 
 from llm_core.client import LLMClient, LLMError, ServerNotRunningError
@@ -22,35 +21,70 @@ def looks_like_desktop_command(text):
 _INTENT_TOOL = {
     'type':'function',
     'function':{
-        'name':'classify_desktop_intent',
-        'description':'只识别用户是否要求执行桌面操作，不执行操作。',
+        'name':'classify_request',
+        'description':'识别请求应直接聊天、执行桌面操作，还是调用本机工具；本工具不执行操作。',
         'parameters':{
             'type':'object',
             'properties':{
                 'action':{
                     'type':'string',
                     'enum':['none','clarify','cancel','undo','volume_set','volume_delta',
-                            'brightness_set','brightness_delta','mute','media','app'],
+                            'brightness_set','brightness_delta','mute','media','app',
+                            'execute_command','read_file','write_file','list_directory'],
                 },
                 'value':{
-                    'description':'百分比、增减量、布尔值、媒体动作或白名单应用名。',
+                    'description':'字符串形式的百分比、增减量、布尔值、媒体动作或应用名；未使用时为空。',
+                    'type':'string',
                 },
+                'command':{'type':'string','description':'execute_command 的命令，否则为空字符串。'},
+                'path':{'type':'string','description':'文件或目录路径，否则为空字符串。'},
+                'content':{'type':'string','description':'write_file 的内容，否则为空字符串。'},
                 'confidence':{'type':'number','minimum':0,'maximum':1},
             },
-            'required':['action','confidence'],
+            'required':['action','value','command','path','content','confidence'],
             'additionalProperties':False,
         },
     },
 }
 
-_SYSTEM_PROMPT = """你是桌面操作意图分类器，只能调用 classify_desktop_intent，不要回答用户。
-规则：
-1. 只分类用户明确要求执行的操作；询问、解释、假设、教程归为 none。
-2. 否定、取消操作归为 cancel，不能把否定句当成肯定操作。
-3. 音量或亮度的“稍微、一点”默认增减 5；绝对百分比使用 *_set，相对变化使用 *_delta。
-4. 缺少必要目标、包含多个冲突操作或无法确定时归为 clarify。
-5. media 的 value 只能是 play、pause、next、previous；app 的 value 必须是给定白名单名称。
-6. 不得声称已经执行，不能输出 shell 命令。"""
+_KIND_SCHEMA = {
+    'type':'object',
+    'properties':{
+        'kind':{'type':'string','enum':['chat','local_action']},
+        'confidence':{'type':'number'},
+    },
+    'required':['kind','confidence'],
+    'additionalProperties':False,
+}
+
+_KIND_PROMPT = """判断用户是要求助手现在操作/检查这台电脑，还是只聊天、问知识或问做法。
+示例：
+“检查当前哪些程序最占内存” => local_action
+“帮我看看现在谁最耗内存” => local_action
+“声音调小一点” => local_action
+“这个视频声音有点小” => local_action
+“打开浏览器” => local_action
+“怎么检查哪些程序最占内存” => chat
+“用什么命令查看内存” => chat
+“什么是进程内存” => chat
+“nihao” => chat
+注意：怎么、如何、用什么命令是在问方法，不是要求现在执行。
+用户：{text}
+JSON："""
+
+_ACTION_PROMPT = """用户已经明确要求现在操作或检查这台 Linux 电脑。选择动作并生成参数。
+检查系统时间、磁盘、内存、进程、网络等使用 execute_command，command 必须是真实可运行的安全 shell 命令。
+文件读取用 read_file；写文件用 write_file；列目录用 list_directory。音量、亮度、媒体和打开应用使用对应专用动作。
+音量或亮度的“一点”默认增减 5；绝对百分比使用 *_set，相对变化使用 *_delta。
+media 的 value 只能是 play、pause、next、previous；app 的 value 必须来自允许的应用名。
+未使用的字符串字段填空；value 中的数值和布尔值也写成字符串。
+示例：“检查哪些程序最占内存” => action=execute_command, command=ps -eo pid,comm,rss,%mem --sort=-rss | head -n 11
+示例：“声音调小一点” => action=volume_delta, value=-5
+示例：“列出 /tmp” => action=list_directory, path=/tmp
+用户：{text}
+最近调节目标：{last_target}
+允许的应用名：{apps}
+JSON："""
 
 
 class ModelIntentRecognizer:
@@ -60,35 +94,24 @@ class ModelIntentRecognizer:
 
     def classify(self,text,last_target=None):
         apps='、'.join(APPS)
-        user=(f'用户原话：{text}\n最近调节目标：{last_target or "无"}\n'
-              f'允许的应用名：{apps}')
-        choice={'type':'function','function':{'name':'classify_desktop_intent'}}
         try:
-            response=self.client.chat(
-                [{'role':'system','content':_SYSTEM_PROMPT},{'role':'user','content':user}],
-                tools=[_INTENT_TOOL],temperature=0,max_tokens=160,tool_choice=choice,
+            kind=self.client.complete_json(
+                _KIND_PROMPT.format(text=text),_KIND_SCHEMA,max_tokens=64,
             )
-        except (LLMError,ServerNotRunningError):
+            confidence=float(kind.get('confidence',0))
+            if kind.get('kind')=='chat' and confidence>=self.confidence_threshold:
+                return Intent('chat')
+            if kind.get('kind')!='local_action' or confidence<self.confidence_threshold:
+                return Intent('clarify')
+            response=self.client.complete_json(
+                _ACTION_PROMPT.format(
+                    text=text,last_target=last_target or '无',apps=apps
+                ),
+                _INTENT_TOOL['function']['parameters'],max_tokens=256,
+            )
+        except (LLMError,ServerNotRunningError,TypeError,ValueError):
             return Intent('clarify')
-        return self._parse_response(response)
-
-    def _parse_response(self,response):
-        try:
-            message=response['choices'][0]['message']
-        except (KeyError,IndexError,TypeError):
-            return Intent('clarify')
-        args=None
-        calls=message.get('tool_calls') or []
-        for call in calls:
-            function=call.get('function') or {}
-            if function.get('name')=='classify_desktop_intent':
-                args=function.get('arguments'); break
-        if args is None:
-            args=message.get('content')
-        if isinstance(args,str):
-            try: args=json.loads(args)
-            except (ValueError,TypeError): return Intent('clarify')
-        return self._validate(args)
+        return self._validate(response)
 
     def _validate(self,args):
         if not isinstance(args,dict): return Intent('clarify')
@@ -99,6 +122,21 @@ class ModelIntentRecognizer:
             return Intent('clarify')
         if action=='none': return Intent('chat')
         if action in ('clarify','cancel','undo'): return Intent(action)
+        if action=='execute_command':
+            command=args.get('command')
+            if isinstance(command,str) and 0<len(command.strip())<=1000:
+                return Intent('tool',(action,{'command':command.strip()}))
+            return Intent('clarify')
+        if action in ('read_file','list_directory'):
+            path=args.get('path')
+            if isinstance(path,str) and 0<len(path.strip())<=1000:
+                return Intent('tool',(action,{'path':path.strip()}))
+            return Intent('clarify')
+        if action=='write_file':
+            path=args.get('path'); content=args.get('content')
+            if isinstance(path,str) and path.strip() and isinstance(content,str):
+                return Intent('tool',(action,{'path':path.strip(),'content':content}))
+            return Intent('clarify')
         value=args.get('value')
         if action in ('volume_set','volume_delta','brightness_set','brightness_delta'):
             if isinstance(value,bool): return Intent('clarify')
@@ -107,7 +145,7 @@ class ModelIntentRecognizer:
             if action.endswith('_set') and not 0<=value<=100: return Intent('clarify')
             if action.endswith('_delta') and (value==0 or not -100<=value<=100): return Intent('clarify')
             return Intent(action,value)
-        if action=='mute' and isinstance(value,bool): return Intent(action,value)
+        if action=='mute' and value in ('true','false'): return Intent(action,value=='true')
         if action=='media' and value in ('play','pause','next','previous'): return Intent(action,value)
         if action=='app' and isinstance(value,str):
             value=value.lower()

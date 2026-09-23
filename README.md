@@ -18,8 +18,8 @@ execution rules.
 
 - Streaming chat through an OpenAI-compatible HTTP/SSE client
 - Shared `llm_core` for the PyQt6 UI, local clients, and Plasma backend
-- Deterministic local routing for common desktop commands, with constrained
-  model-based intent recognition as a validated fallback
+- Deterministic handling for exact desktop commands, plus two-stage,
+  schema-constrained model routing for open-ended local operations
 - Multi-turn tool calling with bounded iterations and explicit error handling
 - Confirmation gates for shell commands, file writes, and reads outside allowed roots
 - Sensitive-path protection, dangerous-command blocking, and redacted JSONL audit logs
@@ -39,7 +39,7 @@ flowchart LR
     B --> C
     C --> R[Local intent router]
     R -->|Known command| D[Checked desktop controller]
-    R -->|Ambiguous command| I[Constrained model intent classifier]
+    R -->|Unrecognized request| I[Schema-constrained model router]
     R -->|Conversation| A[Agent loop and tool registry]
     I --> D
     A --> S[Confirmation, policy, and audit]
