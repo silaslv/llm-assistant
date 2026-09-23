@@ -83,6 +83,7 @@ class LLMClient:
         tools: list[dict] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        tool_choice: dict | str | None = None,
     ) -> dict:
         """
         发送聊天请求（同步模式）。
@@ -92,6 +93,7 @@ class LLMClient:
             tools: 工具定义列表
             temperature: 温度参数（覆盖默认值）
             max_tokens: 最大 token 数（覆盖默认值）
+            tool_choice: 强制或限制模型选择指定工具
 
         Returns:
             API 响应的完整 JSON 字典
@@ -109,6 +111,8 @@ class LLMClient:
         }
         if tools:
             payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
 
         try:
             req = urllib.request.Request(

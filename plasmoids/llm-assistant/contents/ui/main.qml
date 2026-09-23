@@ -1,268 +1,417 @@
 import QtQuick
 import QtQuick.Layouts
+import QtQuick.Controls as Controls
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
-import org.kde.plasma.components 3.0 as PlasmaComponents
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.workspace.dbus as DBus
 
 PlasmoidItem {
     id: root
-
     preferredRepresentation: compactRepresentation
     Plasmoid.status: PlasmaCore.Types.ActiveStatus
     Plasmoid.backgroundHints: PlasmaCore.Types.NoBackground
+    Plasmoid.icon: Qt.resolvedUrl("assistant.svg").toString()
+    toolTipMainText: "小希 · 本地助手"
+    toolTipSubText: "点击说话，或输入电脑控制指令"
 
-    property string outputText: "就绪"
+    property bool backendReady: false
     property bool isListening: false
     property bool isProcessing: false
-    property int selectedMode: 0
-    property bool backendReady: false
+    property bool historyExpanded: false
+    property bool pollPending: false
+    property int voiceEpoch: 0
+    property string statusText: "连接中"
+    property string feedback: "点击麦克风开始 · 常用电脑控制无需大模型"
+    property string draft: ""
+    readonly property bool busy: isListening || isProcessing
+    readonly property color ink: "#183e36"
+    readonly property color muted: "#738780"
+    readonly property color accent: "#226b55"
 
-    readonly property string robotIcon: Qt.resolvedUrl("../icons/robot.svg")
-    readonly property string robotAvatar: Qt.resolvedUrl("../icons/robot.svg")
+    ListModel { id: conversation }
 
-    function callBackend(method, args, callback) {
-        var msg = {
+    component SoftButton: Controls.Button {
+        id: control
+        property bool primary: false
+        property bool quiet: false
+        implicitHeight: 34
+        leftPadding: 12
+        rightPadding: 12
+        font.pixelSize: 12
+        contentItem: Text {
+            text: control.text
+            font: control.font
+            color: !control.enabled ? "#a5b5ac" : control.primary ? "#ffffff" : "#547266"
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+        }
+        background: Rectangle {
+            radius: 9
+            color: control.primary ? (control.enabled ? (control.down ? "#144833" : control.hovered ? "#18573f" : "#226b55") : "#d9e5dc")
+                : control.hovered ? "#e3eee7" : control.quiet ? "transparent" : "#edf3ef"
+            border.width: control.primary || control.quiet ? 0 : 1
+            border.color: control.activeFocus ? "#226b55" : "#e0e9e3"
+        }
+    }
+
+    function addMessage(speaker, content) {
+        conversation.append({"speaker": speaker, "body": String(content)})
+        while (conversation.count > 60) conversation.remove(0)
+    }
+
+    function callBackend(method, args, callback, errorCallback) {
+        var pending = DBus.SessionBus.asyncCall({
             "service": "org.kde.plasma.llm-assistant",
             "path": "/llm_assistant",
             "iface": "org.kde.plasma.llm_assistant",
-            "member": method
-        }
-        if (args && args.length > 0) msg.arguments = args
-        var pending = DBus.SessionBus.asyncCall(msg)
+            "member": method,
+            "arguments": args || []
+        })
         pending.finished.connect(function() {
-            console.log("DBus " + method + " returned:", pending.value)
-            if (callback) callback(pending.value)
+            if (pending.isError) {
+                root.backendReady = false
+                root.statusText = "未连接"
+                root.feedback = "助手暂时无法连接，点击下方“重新连接”重试。"
+                if (errorCallback) errorCallback()
+            } else {
+                root.backendReady = true
+                if (callback) callback(pending.value)
+            }
             pending.destroy()
         })
-        pending.error.connect(function(err) {
-            console.log("DBus " + method + " error:", err)
+    }
+
+    function connectBackend() {
+        callBackend("health", [], function() {
+            if (!root.busy) {
+                root.statusText = "待命"
+                root.feedback = "点击麦克风开始 · 常用电脑控制无需大模型"
+            }
         })
+    }
+
+    function sendQuery(text) {
+        text = text.trim()
+        if (!text || root.busy) return false
+        root.isProcessing = true
+        root.statusText = "处理中"
+        root.feedback = "正在处理你的请求…"
+        addMessage("user", text)
+        callBackend("processQuery", [text, false], function(result) {
+            root.isProcessing = false
+            var answer = String(result || "没有收到回复，请重试。")
+            addMessage("assistant", answer)
+            root.feedback = answer
+            root.statusText = /失败|错误|未运行|拒绝|异常/.test(answer) ? "未完成" : "完成"
+        }, function() { root.isProcessing = false })
+        return true
+    }
+
+    function startListening() {
+        if (root.busy) return
+        root.voiceEpoch += 1
+        var epoch = root.voiceEpoch
+        root.isListening = true
+        root.statusText = "语音中"
+        root.feedback = "请说话，常用指令识别后执行 · 再点一次取消"
+        callBackend("startListening", [], function(result) {
+            if (epoch !== root.voiceEpoch) return
+            if (/失败|不存在/.test(String(result))) {
+                root.isListening = false
+                root.statusText = "未完成"
+                root.feedback = String(result)
+            }
+        }, function() { root.isListening = false })
+    }
+
+    function stopListening() {
+        root.voiceEpoch += 1
+        root.isListening = false
+        root.statusText = "已取消"
+        callBackend("stopListening", [], function(result) { root.feedback = String(result) })
+    }
+
+    function finishVoice(result) {
+        var message = String(result || "没有识别到语音，请重试。")
+        var split = message.indexOf("\n\n")
+        if (message.indexOf("听到：") === 0 && split >= 0) {
+            var heard = message.substring(3, split)
+            var answer = message.substring(split + 2)
+            addMessage("user", heard)
+            addMessage("assistant", answer)
+            root.feedback = answer
+            if (answer.indexOf("请确认识别内容") >= 0) root.draft = heard
+        } else {
+            root.feedback = message
+            addMessage("assistant", message)
+        }
+        root.statusText = /失败|没有识别|超时/.test(message) ? "未听清" : "完成"
     }
 
     compactRepresentation: Item {
-        width: 48
-        height: 48
-
+        implicitWidth: 40
+        implicitHeight: 40
         Image {
-            id: robotImg
+            id: entryIcon
             anchors.centerIn: parent
-            width: 40
-            height: 40
-            source: root.robotIcon
+            width: Math.max(16, Math.min(parent.width, parent.height) - 4)
+            height: width
+            source: Qt.resolvedUrl("assistant.svg")
+            sourceSize.width: 96
+            sourceSize.height: 96
             fillMode: Image.PreserveAspectFit
             smooth: true
-            opacity: 0.85
-
-            Behavior on opacity { NumberAnimation { duration: 150 } }
+            scale: entryMouse.containsMouse ? 1.06 : 1
+            Behavior on scale { NumberAnimation { duration: 140 } }
         }
-
         MouseArea {
+            id: entryMouse
             anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
             hoverEnabled: true
-            onEntered: robotImg.opacity = 1.0
-            onExited: robotImg.opacity = 0.85
-            onClicked: root.expanded = true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.expanded = !root.expanded
         }
     }
 
-    fullRepresentation: ColumnLayout {
-        spacing: 0
-        Layout.minimumWidth: 320
-        Layout.minimumHeight: 420
-        Layout.preferredWidth: 360
-        Layout.preferredHeight: 480
-        Layout.maximumWidth: 400
+    fullRepresentation: Rectangle {
+        id: panel
+        implicitWidth: 480
+        implicitHeight: root.historyExpanded ? 650 : 374
+        Layout.minimumWidth: 440
+        Layout.preferredWidth: 480
+        Layout.maximumWidth: 600
+        Layout.minimumHeight: implicitHeight
+        Layout.maximumHeight: implicitHeight
+        Layout.preferredHeight: implicitHeight
+        color: "#f7faf8"
+        radius: 20
+        border.color: "#d8e5df"
+        border.width: 1
+        clip: true
 
-        MouseArea { anchors.fill: parent; acceptedButtons: Qt.NoButton }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 22
+            spacing: 12
 
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.margins: 10
-            spacing: 8
-
-            Rectangle {
-                width: 32; height: 32; radius: 10
-                color: "#1e66f5"
-                Image {
-                    anchors.centerIn: parent
-                    width: 22; height: 22
-                    source: root.robotAvatar
-                    fillMode: Image.PreserveAspectFit
-                    smooth: true
-                }
-            }
-
-            ColumnLayout {
+            RowLayout {
                 Layout.fillWidth: true
-                spacing: 0
-                PlasmaComponents.Label {
-                    text: "AI 助手"
-                    font.pixelSize: 13
-                    font.bold: true
-                    color: Kirigami.Theme.textColor
+                spacing: 9
+                Image { source: Qt.resolvedUrl("mark.svg"); Layout.preferredWidth: 23; Layout.preferredHeight: 23 }
+                Text { text: "小希"; font.pixelSize: 18; font.weight: Font.DemiBold; color: root.ink }
+                Text { text: "LOCAL ASSISTANT"; font.pixelSize: 9; font.letterSpacing: 0.8; color: root.muted }
+                Item { Layout.fillWidth: true }
+                Rectangle {
+                    implicitWidth: statusLabel.implicitWidth + 18
+                    implicitHeight: 26
+                    radius: 9
+                    color: root.isListening ? "#d9eee4" : "#e7efe9"
+                    Text { id: statusLabel; anchors.centerIn: parent; text: root.statusText; font.pixelSize: 11; color: "#4e7465" }
                 }
-                PlasmaComponents.Label {
-                    text: root.backendReady ? "已连接" : "连接中..."
-                    font.pixelSize: 9
-                    color: root.backendReady ? Qt.rgba(0.25, 0.63, 0.17, 1) : Kirigami.Theme.disabledTextColor
+                SoftButton {
+                    text: "×"; quiet: true; font.pixelSize: 20
+                    implicitWidth: 26; implicitHeight: 28; leftPadding: 0; rightPadding: 0
+                    Accessible.name: "收起助手"
+                    onClicked: root.expanded = false
                 }
             }
 
-            PlasmaComponents.ComboBox {
-                model: ["问答", "命令"]
-                currentIndex: root.selectedMode
-                onCurrentIndexChanged: root.selectedMode = currentIndex
-                Layout.preferredWidth: 72
-                Layout.preferredHeight: 26
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                spacing: 12
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Text { text: root.isListening ? "我在听，请说…" : "说一句，我来帮你"; font.pixelSize: 23; font.weight: Font.DemiBold; color: root.ink }
+                    Text { text: "调节电脑，打开应用，或聊一聊。"; font.pixelSize: 12; color: root.muted }
+                }
+                Item { Layout.fillWidth: true }
+                Controls.Button {
+                    id: microphone
+                    implicitWidth: 64
+                    implicitHeight: 64
+                    enabled: !root.isProcessing
+                    Accessible.name: root.isListening ? "取消录音" : "开始语音输入"
+                    Controls.ToolTip.visible: hovered
+                    Controls.ToolTip.text: root.isListening ? "取消本次语音" : "点击说话"
+                    background: Rectangle {
+                        radius: 32
+                        color: !microphone.enabled ? "#adc6b8" : root.isListening ? "#bd654d" : microphone.hovered ? "#18573f" : root.accent
+                        Behavior on color { ColorAnimation { duration: 140 } }
+                    }
+                    contentItem: Item {
+                        Image {
+                            anchors.centerIn: parent
+                            width: 28; height: 28
+                            source: Qt.resolvedUrl(root.isListening ? "stop.svg" : "microphone.svg")
+                        }
+                    }
+                    onClicked: root.isListening ? root.stopListening() : root.startListening()
+                }
             }
-        }
 
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.leftMargin: 10; Layout.rightMargin: 10
-            Layout.preferredHeight: 1
-            color: Qt.rgba(0, 0, 0, 0.08)
-        }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 7
+                Repeater {
+                    model: ["音量设为30%", "打开浏览器", "屏幕暗一点"]
+                    delegate: SoftButton {
+                        required property string modelData
+                        text: modelData
+                        font.pixelSize: 11
+                        leftPadding: 10; rightPadding: 10
+                        enabled: !root.busy
+                        onClicked: root.sendQuery(modelData)
+                    }
+                }
+                Item { Layout.fillWidth: true }
+            }
 
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            Layout.margins: 10
-            color: Qt.rgba(0, 0, 0, 0.03)
-            radius: 8
-            border.color: Qt.rgba(0, 0, 0, 0.08)
-            border.width: 1
-
-            PlasmaComponents.ScrollView {
-                anchors.fill: parent
-                anchors.margins: 8
+            ListView {
+                id: historyView
+                visible: root.historyExpanded
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.minimumHeight: root.historyExpanded ? 120 : 0
                 clip: true
-                PlasmaComponents.TextArea {
-                    id: outputArea
-                    text: root.outputText
-                    readOnly: true
-                    wrapMode: Text.Wrap
-                    color: Kirigami.Theme.textColor
+                spacing: 10
+                model: conversation
+                boundsBehavior: Flickable.StopAtBounds
+                Controls.ScrollBar.vertical: Controls.ScrollBar { }
+                onCountChanged: Qt.callLater(function() { historyView.positionViewAtEnd() })
+                delegate: Rectangle {
+                    required property string speaker
+                    required property string body
+                    width: historyView.width - 8
+                    height: messageColumn.implicitHeight + 24
+                    radius: 12
+                    color: speaker === "user" ? "#e5efe9" : "#ffffff"
+                    border.width: speaker === "user" ? 0 : 1
+                    border.color: "#e2eae5"
+                    Column {
+                        id: messageColumn
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 12 }
+                        spacing: 5
+                        Text { text: speaker === "user" ? "你" : "小希"; font.pixelSize: 10; font.weight: Font.DemiBold; color: "#7e9387" }
+                        TextEdit {
+                            width: parent.width
+                            text: body
+                            textFormat: TextEdit.PlainText
+                            readOnly: true
+                            selectByMouse: true
+                            wrapMode: TextEdit.Wrap
+                            font.pixelSize: 13
+                            color: "#243b3b"
+                            selectedTextColor: "#183e36"
+                            selectionColor: "#c9e5d7"
+                        }
+                    }
+                }
+                Text {
+                    anchors.centerIn: parent
+                    visible: conversation.count === 0
+                    text: "从一句简单的指令开始"
                     font.pixelSize: 12
-                    background: null
-                    textFormat: Text.MarkdownText
-                    onTextChanged: cursorPosition = text.length
+                    color: "#91a297"
                 }
             }
-        }
-
-        PlasmaComponents.Label {
-            text: root.isListening ? "🎤 正在听..." : root.isProcessing ? "⏳ 处理中..." : ""
-            font.pixelSize: 10
-            color: Qt.rgba(0.12, 0.4, 0.96, 1)
-            visible: root.isListening || root.isProcessing
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.margins: 10; Layout.topMargin: 0
-            spacing: 6
 
             Rectangle {
                 Layout.fillWidth: true
-                height: 34; radius: 8
-                color: Qt.rgba(0, 0, 0, 0.03)
-                border.color: inputField.activeFocus ? Qt.rgba(0.12, 0.4, 0.96, 1) : Qt.rgba(0, 0, 0, 0.08)
+                Layout.preferredHeight: 56
+                color: "#ffffff"
+                radius: 12
                 border.width: 1
-                PlasmaComponents.TextField {
-                    id: inputField
-                    anchors.fill: parent; anchors.margins: 4
-                    placeholderText: "输入问题或命令..."
-                    color: Kirigami.Theme.textColor
-                    font.pixelSize: 12
-                    background: null
-                    placeholderTextColor: Kirigami.Theme.disabledTextColor
-                    onAccepted: {
-                        if (text.trim().length > 0) { root.sendQuery(text.trim()); text = "" }
+                border.color: inputField.activeFocus ? "#6b9f85" : "#d9e5dd"
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.margins: 6
+                    spacing: 5
+                    Controls.TextField {
+                        id: inputField
+                        Layout.fillWidth: true
+                        enabled: !root.busy
+                        text: root.draft
+                        onTextEdited: root.draft = text
+                        placeholderText: "也可以输入指令…"
+                        font.pixelSize: 13
+                        color: "#243b3b"
+                        placeholderTextColor: "#899b92"
+                        selectionColor: "#c9e5d7"
+                        selectedTextColor: root.ink
+                        background: Item {}
+                        onAccepted: if (root.sendQuery(text)) root.draft = ""
+                    }
+                    SoftButton {
+                        text: "发送"; primary: true
+                        implicitHeight: 40
+                        enabled: inputField.text.trim().length > 0 && !root.busy
+                        onClicked: if (root.sendQuery(inputField.text)) root.draft = ""
                     }
                 }
             }
 
-            PlasmaComponents.ToolButton {
-                icon.name: root.isListening ? "media-record-stop" : "audio-input-microphone"
-                onClicked: { if (root.isListening) root.stopListening(); else root.startListening() }
-                background: Rectangle { radius: 8; color: root.isListening ? Qt.rgba(0.82, 0.06, 0.22, 1) : Qt.rgba(0.25, 0.63, 0.17, 1) }
-                contentItem: Kirigami.Icon { source: parent.icon.name; width: 18; height: 18; color: "white" }
+            Text {
+                Layout.fillWidth: true
+                Layout.minimumHeight: 34
+                Layout.maximumHeight: 44
+                text: root.feedback
+                font.pixelSize: 11
+                color: "#7b8e83"
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
             }
+            Item { visible: !root.historyExpanded; Layout.fillHeight: true }
 
-            PlasmaComponents.ToolButton {
-                icon.name: "document-send"
-                enabled: inputField.text.trim().length > 0 && !root.isProcessing
-                onClicked: { root.sendQuery(inputField.text.trim()); inputField.text = "" }
-                background: Rectangle { radius: 8; color: parent.enabled ? Qt.rgba(0.12, 0.4, 0.96, 1) : Qt.rgba(0, 0, 0, 0.05) }
-                contentItem: Kirigami.Icon { source: parent.icon.name; width: 18; height: 18; color: parent.enabled ? "white" : Kirigami.Theme.disabledTextColor }
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.margins: 10; Layout.topMargin: 0
-            spacing: 4
-            Repeater {
-                model: [
-                    { icon: "audio-volume-high", cmd: "volume_up" },
-                    { icon: "audio-volume-low", cmd: "volume_down" },
-                    { icon: "weather-clear", cmd: "brightness_up" },
-                    { icon: "weather-clear-night", cmd: "brightness_down" }
-                ]
-                PlasmaComponents.ToolButton {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 28
-                    icon.name: modelData.icon
-                    onClicked: root.sendCommand(modelData.cmd)
-                    contentItem: Kirigami.Icon { source: modelData.icon; width: 14; height: 14; color: Kirigami.Theme.textColor }
-                    background: Rectangle { radius: 6; color: parent.hovered ? Qt.rgba(0, 0, 0, 0.05) : "transparent"; border.color: Qt.rgba(0, 0, 0, 0.08); border.width: 1 }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 3
+                SoftButton {
+                    text: root.historyExpanded ? "收起对话" : "展开对话"
+                    quiet: true
+                    font.pixelSize: 11
+                    leftPadding: 2; rightPadding: 10
+                    onClicked: root.historyExpanded = !root.historyExpanded
+                }
+                SoftButton {
+                    text: "撤销调节"; quiet: true; font.pixelSize: 11
+                    enabled: !root.busy
+                    onClicked: root.sendQuery("撤销上次调节")
+                }
+                Item { Layout.fillWidth: true }
+                SoftButton {
+                    text: root.backendReady ? "本地连接" : "重新连接"
+                    quiet: true; font.pixelSize: 11
+                    enabled: !root.busy
+                    onClicked: root.connectBackend()
                 }
             }
         }
-    }
-
-    function sendQuery(text) {
-        root.isProcessing = true
-        root.outputText = "思考中...\n\n" + text
-        callBackend("processQuery", [text, root.selectedMode === 1], function(r) { root.outputText = r; root.isProcessing = false })
-    }
-    function sendCommand(command) {
-        root.isProcessing = true
-        root.outputText = "执行: " + command
-        callBackend("executeCommand", [command], function(r) { root.outputText = r; root.isProcessing = false })
-    }
-    function startListening() {
-        root.isListening = true
-        root.outputText = "🎤 正在听，请说话..."
-        callBackend("startListening", [], function(r) {
-            root.outputText = r
-        })
-    }
-    function stopListening() {
-        root.isListening = false
-        callBackend("stopListening", [], function(r) { root.outputText = r })
-    }
-    Component.onCompleted: {
-        callBackend("health", [], function() { root.backendReady = true })
     }
 
     Timer {
-        id: stateTimer
-        interval: 1000
+        interval: 900
         running: root.isListening
         repeat: true
         onTriggered: {
-            callBackend("getState", [], function(r) {
-                if (r === "idle") {
+            if (root.pollPending) return
+            root.pollPending = true
+            var epoch = root.voiceEpoch
+            root.callBackend("getState", [], function(state) {
+                root.pollPending = false
+                if (epoch !== root.voiceEpoch || !root.isListening) return
+                if (String(state) === "idle") {
                     root.isListening = false
-                    stateTimer.stop()
+                    root.callBackend("getVoiceResult", [], function(result) {
+                        if (epoch === root.voiceEpoch) root.finishVoice(result)
+                    })
                 }
-            })
+            }, function() { root.pollPending = false; root.isListening = false })
         }
     }
+    Component.onCompleted: root.connectBackend()
 }

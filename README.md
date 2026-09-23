@@ -18,12 +18,16 @@ execution rules.
 
 - Streaming chat through an OpenAI-compatible HTTP/SSE client
 - Shared `llm_core` for the PyQt6 UI, local clients, and Plasma backend
+- Deterministic local routing for common desktop commands, with constrained
+  model-based intent recognition as a validated fallback
 - Multi-turn tool calling with bounded iterations and explicit error handling
 - Confirmation gates for shell commands, file writes, and reads outside allowed roots
 - Sensitive-path protection, dangerous-command blocking, and redacted JSONL audit logs
 - KDE Plasma 6 widget over D-Bus and a Unix-socket interface for local clients
-- Optional voice input plus volume and brightness controls
-- 65 unit tests covering the agent loop, tools, configuration, and security policy
+- Optional voice input plus checked volume, brightness, media, and app controls
+- Floating, chat, sidebar, mini, and auto-docking UI modes with conversation copying
+- Unit tests covering the agent loop, desktop routing, voice protocol, tools,
+  configuration, and security policy
 
 ## Architecture
 
@@ -33,18 +37,24 @@ flowchart LR
     P[KDE Plasma widget] -->|D-Bus| B[Local backend]
     U[Local client] -->|Unix socket| B
     B --> C
-    C --> A[Agent loop and tool registry]
+    C --> R[Local intent router]
+    R -->|Known command| D[Checked desktop controller]
+    R -->|Ambiguous command| I[Constrained model intent classifier]
+    R -->|Conversation| A[Agent loop and tool registry]
+    I --> D
     A --> S[Confirmation, policy, and audit]
     A -->|OpenAI-compatible HTTP/SSE| L[llama-server]
+    I -->|Structured action only| L
 ```
 
 ## Repository layout
 
-- `scripts/llm-assistant` - starts the model server when needed, then launches the PyQt6 UI
+- `scripts/llm-assistant` - launches the PyQt6 UI with a lightweight default model profile
 - `scripts/llm-assistant-qt.py` - floating desktop UI and system tray integration
 - `scripts/llm-assistant-backend.py` - D-Bus and Unix-socket backend
 - `scripts/llama-serve` - local model launcher and model-alias configuration
-- `scripts/llm_core/` - client, agent loop, tools, configuration, and security policy
+- `scripts/llm_core/` - client, agent loop, deterministic desktop controller,
+  constrained intent classifier, tools, configuration, and security policy
 - `plasmoids/llm-assistant/` - KDE Plasma 6 widget
 - `scripts/tests/` - unit tests
 
@@ -71,6 +81,18 @@ Start the floating assistant:
 scripts/llm-assistant
 ```
 
+The window starts immediately. Common desktop commands work without a running
+chat model. For conversation and ambiguous-command recognition, use the UI's
+model button or start a server explicitly:
+
+```bash
+scripts/llama-serve lfm28
+```
+
+The default assistant profile is `LFM2-8B-A1B-Q4_K_M` with an 8K context,
+512 MiB server cache, full GPU offload, Q8 KV cache, Flash Attention, and mmap.
+Larger reasoning and coding profiles remain available through `llama-serve`.
+
 Install the Plasma widget:
 
 ```bash
@@ -96,5 +118,3 @@ confirmation prompt and do not treat model output as trusted instructions.
 ```bash
 python -m pytest -q
 ```
-
-Current local verification: **65 tests passed**.

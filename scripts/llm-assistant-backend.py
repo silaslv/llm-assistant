@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from llm_core.client import LLMClient, ServerNotRunningError
 from llm_core.agent import AgentLoop
+from llm_core.session import AssistantSession
 from llm_core.tools import execute_fixed_command
 from llm_core.config import get_config
 
@@ -34,7 +35,7 @@ from gi.repository import GLib
 # 配置
 # ============================================================
 SOCKET_PATH = "/tmp/llm-assistant.sock"
-VOICE_SCRIPT = Path.home() / ".local/bin/voice-control-run"
+VOICE_SCRIPT = Path(__file__).resolve().parent / "voice-control.py"
 DBUS_BUS_NAME = "org.kde.plasma.llm-assistant"
 DBUS_OBJECT_PATH = "/llm_assistant"
 DBUS_INTERFACE = "org.kde.plasma.llm_assistant"
@@ -52,6 +53,12 @@ class LLMAssistant:
         self._is_listening = False
         self._voice_thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._query_lock = threading.Lock()
+        self._session = AssistantSession()
+        self._voice_proc = None
+        self._voice_cancel = threading.Event()
+        self.voice_result = ""
+        self._voice_accepting = False
 
     @property
     def is_listening(self) -> bool:
@@ -60,57 +67,79 @@ class LLMAssistant:
 
     def process_query(self, query: str, is_command_mode: bool = False) -> str:
         """处理用户查询"""
-        if not self._client.check_health():
-            return "❌ llama-server 未运行\n请先执行: llama-serve qwen36 &"
-
-        try:
-            return self._agent.run(query)
-        except ServerNotRunningError:
-            return "❌ llama-server 未运行\n请先执行: llama-serve qwen36 &"
-        except Exception as e:
-            return f"❌ 错误: {e}"
+        with self._query_lock:
+            try:
+                parts=[]
+                for event in self._session.stream(query):
+                    if event.get("type") in ("text", "error"):
+                        parts.append(event.get("content", ""))
+                return "".join(parts) or "没有收到回复。"
+            except Exception as e:
+                return f"错误：{e}"
 
     def execute_command(self, name: str) -> str:
         """执行固定命令"""
-        return execute_fixed_command(name)
+        phrases={"volume_up":"音量大一点","volume_down":"音量小一点",
+                 "brightness_up":"屏幕亮一点","brightness_down":"屏幕暗一点","mute":"静音"}
+        return self.process_query(phrases[name]) if name in phrases else f"未知命令：{name}"
 
     def start_listening(self) -> str:
-        """开始语音识别"""
-        if not VOICE_SCRIPT.exists():
-            return f"❌ 语音识别脚本不存在: {VOICE_SCRIPT}"
-
         with self._lock:
             if self._is_listening:
-                return "⚠️ 语音识别已在运行"
-            self._is_listening = True
-
-        def _listen():
+                return "语音识别已在运行"
+            self._is_listening=True
+            self._voice_cancel.clear()
+            self._voice_accepting=True
+            self.voice_result=""
+        def listen():
             try:
-                subprocess.run(
-                    [str(VOICE_SCRIPT), "--mode", "llm", "--once"],
-                    timeout=30,
-                )
-            except subprocess.TimeoutExpired:
-                pass
-            except Exception:
-                pass
+                proc=subprocess.Popen([sys.executable,str(VOICE_SCRIPT),"--once","--transcribe","--json-events"],
+                    stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                with self._lock:
+                    self._voice_proc=proc
+                    if self._voice_cancel.is_set(): proc.terminate()
+                try:
+                    stdout,stderr=proc.communicate(timeout=45)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.communicate()
+                    self.voice_result="语音识别超时，请重试。"
+                    return
+                with self._lock:
+                    if self._voice_cancel.is_set(): return
+                    self._voice_accepting=False
+                events=[]
+                for line in stdout.splitlines():
+                    try: events.append(json.loads(line))
+                    except ValueError: pass
+                errors=[e.get("message","") for e in events if e.get("type")=="error"]
+                final=next((e.get("text","") for e in reversed(events) if e.get("type")=="final"),"")
+                if proc.returncode or errors:
+                    self.voice_result="识别失败："+(errors[-1] if errors else "语音服务异常退出")
+                elif final:
+                    self.voice_result=f"听到：{final}\n\n"+(
+                        self.process_query(final) if self._session.desktop.parse(final) is not None
+                        else "请确认识别内容后，通过输入框发送。")
+                else:
+                    self.voice_result="没有识别到语音，请重试。"
+            except Exception as e:
+                self.voice_result=f"识别失败：{e}"
             finally:
                 with self._lock:
-                    self._is_listening = False
-
-        self._voice_thread = threading.Thread(target=_listen, daemon=True)
+                    self._voice_proc=None
+                    self._is_listening=False
+                    if self._voice_cancel.is_set(): self.voice_result="录音已取消。"
+        self._voice_thread=threading.Thread(target=listen,daemon=True)
         self._voice_thread.start()
-        return "🎤 语音识别已启动"
+        return "正在听，请说话…"
 
     def stop_listening(self) -> str:
-        """停止语音识别"""
         with self._lock:
-            self._is_listening = False
-        try:
-            subprocess.run(["pkill", "-f", "voice-control-run"], capture_output=True, timeout=5)
-        except Exception:
-            pass
-        return "语音识别已停止"
+            if not self._voice_accepting:
+                return "识别已结束，请等待操作结果。"
+            self._voice_cancel.set()
+            if self._voice_proc is not None and self._voice_proc.poll() is None:
+                self._voice_proc.terminate()
+        return "录音已取消。"
 
 
 # ============================================================
@@ -164,6 +193,10 @@ class LLMAssistantDBusService(dbus.service.Object):
     @dbus.service.method(DBUS_INTERFACE, in_signature="", out_signature="s")
     def getState(self) -> str:
         return "listening" if self._assistant.is_listening else "idle"
+
+    @dbus.service.method(DBUS_INTERFACE, in_signature="", out_signature="s")
+    def getVoiceResult(self) -> str:
+        return self._assistant.voice_result
 
     @dbus.service.method(DBUS_INTERFACE, in_signature="", out_signature="s")
     def health(self) -> str:

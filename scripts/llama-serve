@@ -16,6 +16,7 @@ Models (alias → file):
 
 Options:
   --port PORT       server port (default: ${OPCODE_PORT}, opencode 配置的端口)
+  --no-replace      leave existing service on the port running
   -c N              context size (default: model-specific)
   --                pass remaining args directly to llama-server
   -h                show this help
@@ -50,10 +51,10 @@ declare -A MODEL_FILE MODEL_MODE MODEL_CACHE_RAM MODEL_CTX MODEL_HAS_REASONING M
 
 MODEL_FILE[lfm28]="LFM2-8B-A1B-Q4_K_M.gguf"
 MODEL_MODE[lfm28]=dgpu
-MODEL_CACHE_RAM[lfm28]=2048
-MODEL_CTX[lfm28]=16384
+MODEL_CACHE_RAM[lfm28]=512
+MODEL_CTX[lfm28]=8192
 MODEL_HAS_REASONING[lfm28]=false
-MODEL_EXTRA[lfm28]="--reasoning off"
+MODEL_EXTRA[lfm28]="--reasoning off --gpu-layers 99 --cache-type-k q8_0 --cache-type-v q8_0 -t 4"
 
 MODEL_FILE[qwen36]="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 MODEL_MODE[qwen36]=fiton
@@ -107,8 +108,10 @@ EXTRA="${MODEL_EXTRA[$ALIAS]:-}"
 
 ARGS=()
 PORT="$OPCODE_PORT"
+NO_REPLACE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-replace) NO_REPLACE=true; shift ;;
     --port) PORT="$2"; shift 2 ;;
     -c) CTX="$2"; shift 2 ;;
     --) shift; ARGS+=("$@"); break ;;
@@ -118,6 +121,10 @@ done
 
 # kill existing server on the target port
 if lsof -ti "tcp:$PORT" &>/dev/null; then
+  if [[ "$NO_REPLACE" == true ]]; then
+    echo "[llama-serve] port $PORT already in use; leaving existing service running"
+    exit 0
+  fi
   echo "[llama-serve] stopping existing server on port $PORT ..."
   lsof -ti "tcp:$PORT" | xargs -r kill 2>/dev/null
   sleep 1
@@ -129,7 +136,7 @@ SERVER_ARGS=(
   --cache-ram "$CACHE_RAM"
   --port "$PORT"
   --flash-attn on
-  --no-mmap
+  --mmap
 )
 [[ "$MODE" == "fiton" ]] && SERVER_ARGS+=(--fit on)
 [[ -n "$EXTRA" ]] && SERVER_ARGS+=($EXTRA)

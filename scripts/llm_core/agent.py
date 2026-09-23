@@ -163,7 +163,7 @@ class AgentLoop:
                 return content
         return "达到最大工具调用轮数"
 
-    def run_stream(self, query: str, tools: list[dict] | None = None) -> Generator[dict, None, None]:
+    def run_stream(self, query: str, tools: list[dict] | None = None, history: list[dict] | None = None) -> Generator[dict, None, None]:
         """
         流式运行 Agent 循环。
 
@@ -184,6 +184,7 @@ class AgentLoop:
 
         messages: list[dict] = [
             {"role": "system", "content": self._system_prompt},
+            *(history or [])[-12:],
             {"role": "user", "content": query},
         ]
 
