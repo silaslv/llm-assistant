@@ -229,6 +229,7 @@ class TestAgentLoop:
         agent = AgentLoop()
         assert "assistant" in agent._system_prompt.lower()
         assert "execute_command" in agent._system_prompt
+        assert "simple greeting" in agent._system_prompt
 
 
 class TestFallbackCommand:
